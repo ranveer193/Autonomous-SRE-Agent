@@ -1,0 +1,16 @@
+deepagents>=0.7
+langchain>=1.0
+langchain-groq
+langgraph
+chromadb
+httpx
+python-dotenv
+pyyaml
+langchain-google-genai
+langchain-huggingface
+langchain_nvidia_ai_endpoints
+langchain-community
+fastembed
+fastapi
+uvicorn
+langchain-openai

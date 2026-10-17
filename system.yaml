@@ -1,0 +1,29 @@
+# Describes the system the agent is pointed at. This is the ONLY place with system-specific names.
+# Copy and edit it for another system; set SRE_SYSTEM_FILE to use a different path.
+namespace: sre-playground
+services: [api-gateway, order-service, user-service, payment-service]
+writable: [api-gateway, order-service, user-service, payment-service, postgres, redis]   # leave observability out
+topology: |
+  api-gateway -> order-service -> user-service and payment-service.
+  payment-service -> postgres + redis. user-service -> postgres.
+limits: {max_replicas: 20, max_memory_mi: 512}   # ceilings the write tools enforce
+selector_label: app
+thresholds: {error_rate_pct: 5.0, p95_seconds: 1.0}
+metrics:
+  service_label: service
+  requests: 'http_requests_total{route!~"/health|/ready|/metrics"}'
+  errors: 'http_errors_total{route!~"/health|/ready|/metrics"}'
+  duration: 'http_request_duration_seconds_bucket{route!~"/health|/ready|/metrics"}'
+  dependency:
+    errors: downstream_errors_total
+    duration: downstream_request_duration_seconds_bucket
+    source_label: source_service
+    target_label: target_service
+  extra_errors: {database_errors: database_errors_total, redis_errors: redis_errors_total}
+loki:
+  namespace_label: namespace
+  service_label: service
+  level_label: level
+  json_logs: true
+  group_fields: [event, error_type, dependency]
+  show_fields: [level, event, message, error_type, dependency, operation, status_code, route, duration_ms, request_id, trace_id]
