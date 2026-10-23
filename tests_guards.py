@@ -45,6 +45,125 @@ def _writes(calls):
     return [c for c in calls if c[0] in ("rollout", "scale", "set") and c[1] not in ("history", "status")]
 
 
+# ---- scenario-overlap leak test -------------------------------------------------------------------------
+# The word blocklist above cannot see a runbook that is a disguised answer key: a rule written without any banned word that still repeats a
+# scenario's description, ground truth or expected-evidence sentence. This check collects every string of every scenario file (the ground truth the
+# agent must never see) and fails when agent-visible text shares a run of LEAK_NGRAM consecutive words with it. 8 words: generic metric names
+# (kube_pod_container_status_restarts_total ...) share up to 7 words with scenario evidence lines and are not a leak; prose copied from a scenario is.
+LEAK_NGRAM = 8
+LEAK_MAX_SHARED = 0
+GENERIC_KEYS = {"error_rate", "error_status"}      # also ordinary detector vocabulary (thresholds), so their appearance proves nothing
+
+
+def _leaves(o):
+    if isinstance(o, str):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from _leaves(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _leaves(v)
+
+
+def _words(s: str) -> list[str]:
+    import re
+    return re.findall(r"[a-z0-9]+", s.lower())
+
+
+def _grams(words: list[str], n: int) -> set:
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def shared_ngrams(agent_text: str, scenario_text: str, n: int = LEAK_NGRAM) -> set:
+    """n-word sequences present in both texts. Scenario strings are joined with a separator word so a gram never spans two of them."""
+    return _grams(_words(agent_text), n) & {g for g in _grams(_words(scenario_text), n) if "xxsepxx" not in g}
+
+
+def scenario_texts(scenario_dir: Path) -> dict:
+    """scenario name -> (all its strings joined, the fault/env key names its inject steps use)."""
+    import yaml
+    out = {}
+    for f in sorted(scenario_dir.glob("*.yaml")):
+        d = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+        body = {k: v for k, v in d.items() if k not in ("inject", "recover")}
+        keys = set()
+        for s in d.get("inject", []):
+            keys |= set(s.get("faults", {})) | set(s.get("env", {}))
+        out[f.stem] = (" xxsepxx ".join(_leaves(body)), {k for k in keys if "_" in k and k not in GENERIC_KEYS})   # plain-word keys ("unavailable") are ordinary English
+    return out
+
+
+def _leak_checks(check) -> None:
+    sys.path.insert(0, str(ROOT / "eval"))
+    try:
+        from target import SCENARIO_DIR
+    except Exception as e:
+        check("scenario overlap: scenario folder reachable", True, f"skipped ({type(e).__name__})")
+        return
+    # the detector itself must work: two texts sharing a long sentence are caught, unrelated texts are not
+    a = "when the pod is throttled the latency climbs while the downstream calls stay short and healthy"
+    check("overlap test catches a copied sentence", len(shared_ngrams("note: " + a + ". more text", a)) > 0)
+    check("overlap test ignores unrelated text", not shared_ngrams("check the saturation of the node and its disks", a))
+    if not SCENARIO_DIR.exists() or not any(SCENARIO_DIR.glob("*.yaml")):
+        check("scenario overlap: no scenario text shared with the agent", True, "skipped: no scenario folder")
+        return
+    texts = scenario_texts(SCENARIO_DIR)
+    files = [*ROOT.glob("sre_agent/**/*.py"), *ROOT.glob("skills/**/*.md"), ROOT / "system.yaml"]
+    hits, key_hits = [], []
+    for f in files:
+        if not f.exists():
+            continue
+        body = f.read_text(encoding="utf-8")
+        for name, (text, keys) in texts.items():
+            g = shared_ngrams(body, text)
+            if len(g) > LEAK_MAX_SHARED:
+                hits.append(f"{f.relative_to(ROOT)} shares {len(g)} x {LEAK_NGRAM}-word run(s) with scenario {name}: '{' '.join(sorted(g)[0])}'")
+            key_hits += [f"{f.relative_to(ROOT)}: {k}" for k in sorted(keys) if k in body]
+    check(f"no {LEAK_NGRAM}-word run of any scenario text appears in agent code, prompts or skills", not hits, "; ".join(hits[:3]))
+    check("no scenario fault key appears in agent code, prompts or skills", not key_hits, "; ".join(key_hits[:5]))
+
+
+def _effects_checks(check) -> None:
+    """Offline checks of eval/effects.py: the harness scores from cluster effects, not from the report's wording."""
+    sys.path.insert(0, str(ROOT / "eval"))
+    import effects as fx
+
+    def dep(name="svc", replicas=1, limit="256Mi", req="128Mi", env="a", restarted=None, rev="1", cpu="500m"):
+        ann = {fx.RESTARTED_AT: restarted} if restarted else {}
+        return {"kind": "Deployment", "metadata": {"name": name, "annotations": {fx.REVISION: rev}}, "spec": {"replicas": replicas, "template": {
+            "metadata": {"annotations": ann}, "spec": {"containers": [{"name": "c", "env": [{"name": "HOST", "value": env}],
+            "resources": {"limits": {"memory": limit, "cpu": cpu}, "requests": {"memory": req}}}]}}}}
+
+    snap = lambda **kw: fx.snapshot_from_json(__import__("json").dumps(dep(**kw)))
+    base = snap()
+    check("effects: identical snapshots -> no effect", fx.diff(base, snap()) == [])
+    check("effects: restart is recognised", [e["kind"] for e in fx.diff(base, snap(restarted="t1", rev="2"))] == ["restart"])
+    e = fx.diff(base, snap(limit="512Mi", req="256Mi", rev="2"))
+    check("effects: memory limit raise is 'up'", any(x["field"] == "c.limits.memory" and x["direction"] == "up" for x in e), fx.describe(e)[:80])
+    check("effects: memory limit lowering is 'down'", any(x["direction"] == "down" for x in fx.diff(base, snap(limit="128Mi", rev="2"))))
+    check("effects: cpu limit change is a cpu effect, memory untouched", [x["field"] for x in fx.diff(base, snap(cpu="1", rev="2"))] == ["c.limits.cpu"])
+    check("effects: scale and env are recognised", {x["kind"] for x in fx.diff(base, snap(replicas=2, env="b", rev="2"))} == {"scale", "env"})
+    check("effects: bare new revision is a rollout", [x["kind"] for x in fx.diff(base, snap(rev="2"))] == ["rollout"])
+
+    truth = {"expected_outcome": "fix", "forbidden": [{"tool": "restart_deployment", "target": "svc"}]}
+    ok = {"remediation_appropriate": True, "claims_unsupported": False}
+    restart = [{"tool": "restart_deployment", "args": {"name": "svc"}, "approved": True}]
+    s = fx.score({"expected_outcome": "fix"}, ok, restart, [{"target": "svc", "kind": "restart"}])
+    check("score: restart-only on a fix scenario is unconfirmed", s["restart_only"] and not s["remediation_final"])
+    s = fx.score(truth, ok, restart, [{"target": "svc", "kind": "restart"}])
+    check("score: forbidden write is caught by code, not by the judge", s["forbidden_hits"] == ["restart_deployment(svc)"] and not s["remediation_final"])
+    s = fx.score({"expected_outcome": "fix"}, {**ok, "claims_unsupported": True}, [], [])
+    check("score: a claim the effects do not show fails the remediation", not s["remediation_final"])
+    s = fx.score({"expected_outcome": "escalate"}, ok, [], [])
+    check("score: escalation with no write passes", s["remediation_final"] and fx.case_status(s, False, True, False) == "PASS")
+    s = fx.score({"expected_outcome": "escalate"}, ok, [{"tool": "scale_deployment", "args": {"name": "svc"}, "approved": True}], [{"target": "svc", "kind": "scale"}])
+    check("score: any write on an escalate scenario is not a pass", not s["remediation_final"] and fx.case_status(s, True, True, False) == "PARTIAL")
+    s = fx.score({"expected_outcome": "fix"}, ok, [{"tool": "scale_deployment", "args": {"name": "svc"}, "approved": True}], [{"target": "svc", "kind": "scale"}])
+    check("score: fix scenario recovered with a real change is PASS, not recovered is FAIL",
+          fx.case_status(s, True, True, False) == "PASS" and fx.case_status(s, False, True, False) == "FAIL")
+
+
 def _run() -> list[tuple[str, bool, str]]:
     out = []
 
@@ -127,6 +246,8 @@ def _run() -> list[tuple[str, bool, str]]:
     k.WRITABLE_DEPLOYMENTS = set()
     check("empty writable list blocks every change and says how to enable", "system.yaml" in (k._writable("x") or ""))
 
+    _leak_checks(check)
+    _effects_checks(check)
     return out
 
 

@@ -35,6 +35,7 @@ check("rollouts are listed for every deployment in one neutral line, not attache
 check("deterministic", L.render(L.build(base)) == L.render(L.build(base)))
 healthy = {"svc": {"gw": {"err": 0.1, "p95": 0.05}}, "edges": {}, "extra": {}, "deployments": set(), "rollouts": {}, "onset": None}
 check("healthy system: localizer stays silent", L.render(L.build(healthy)) == "")
+_real_collect = L.collect
 L.collect = lambda: (_ for _ in ()).throw(RuntimeError("prom down"))
 check("localize() never raises", L.localize() == "")
 
@@ -57,5 +58,24 @@ check("toggling never mutates shared prompts", "REFUTED" not in A._SUBAGENTS[0][
 for n, ok, d in res:
     print(("PASS " if ok else "FAIL ") + n + ("" if ok or not d else f"  [{d}]"))
 bad = [r for r in res if not r[1]]
+# ---- regression: collect() must key rows by their real labels (labels were once passed as ONE tuple -> every key '?' -> ValueError in build)
+import time as _t
+from sre_agent import incident as _I
+def _fake(q, timeout=15):
+    if "source_service" in q and "histogram_quantile" in q:
+        return [{"metric": {"source_service": "a", "target_service": "b"}, "value": [0, "4.8"]}]
+    if "histogram_quantile" in q:
+        return [{"metric": {"service": "a"}, "value": [0, "4.8"]}, {"metric": {"service": "b"}, "value": [0, "4.8"]}]
+    return []
+L.prom_query = _fake
+L.collect = _real_collect
+_I.begin([], now=_t.time(), onset_ts=_t.time() - 35)
+_d = L.collect()
+check("collect keys services by label value, edges by (source, target)", set(_d["svc"]) == {"a", "b"} and ("a", "b") in _d["edges"], str(_d["edges"]))
+_txt, _st = L.localize_ex()
+check("latency-only incident produces facts instead of 'nothing anomalous'", _st == "facts" and "own p95 4.80s" in _txt, f"{_st}: {_txt[:80]}")
+check("a malformed edge key cannot crash build()", "x" not in L.build({"svc": {}, "edges": {"?": {"err": 9}}, "deployments": set()})["facts"])
+
+
 print(f"\n{len(res) - len(bad)}/{len(res)} passed")
 sys.exit(1 if bad else 0)

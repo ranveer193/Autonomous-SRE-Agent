@@ -5,10 +5,11 @@ from .config import PROVIDER, MODEL_NAME, SUB_PROVIDER, SUB_MODEL
 from . import budget, features as feature_state, tuning as tuning_state
 from .features import Features, from_env
 from .tuning import Tuning, from_env as tuning_from_env
-from .localizer import localize
+from .localizer import localize_ex
 from .preflight import preflight
 from .detect import snapshot_line, find_problems
 from . import incident
+from . import hypothesis as H
 from .rag import start_incident_clock
 from .tools.k8s import reset_attempts
 from .logging_utils import AgentLogger, setup_logging
@@ -36,20 +37,26 @@ def run_alert(alert: str, auto_approve: bool = False, ask=input, on_start=None, 
     start_incident_clock()
     reset_attempts()
     incident.begin([p for p in find_problems() if not p.startswith("detector error")], onset_ts=onset)   # onset, symptom signature, clean write log
+    H.begin()                                         # empty ledger and observation registry (nothing from the previous run; unused when the feature is off)
     tracer.note("🕒", f"incident window: {incident.describe_window()} | signature: {incident.signature() or '-'}", event="window")
     t0 = time.time()
     loc_text, loc_s = "", 0.0
     if f.localizer:                                   # deterministic, zero tokens; counted in wall time (and so in MTTR)
         tl = time.time()
-        loc_text, loc_s = localize(), round(time.time() - tl, 2)
-        tracer.note("🧭", f"localizer ({loc_s}s): {loc_text or 'nothing anomalous'}", event="localizer", seconds=loc_s)
-    loc_block = f"\n\nLOCALIZER (deterministic, from metrics):\n{loc_text}" if loc_text else ""
+        (loc_text, loc_status), loc_s = localize_ex(), round(time.time() - tl, 2)
+        _none = {"no_facts": "no metric facts crossed a threshold (not a health verdict)",
+                 "incomplete": "some metric queries failed, no facts available (see warnings above)",
+                 "error": "evidence board failed (see warning above), no facts available"}
+        tracer.note("🧭", f"evidence board ({loc_s}s, {loc_status}): {loc_text or _none.get(loc_status, 'no facts')}", event="localizer", seconds=loc_s, status=loc_status)
+    loc_tag = f" [{H.observe('localizer', ('metrics',), loc_text)}]" if f.hypothesis and loc_text else ""     # ledger evidence may cite it: ONE metrics signal
+    loc_block = f"\n\nLOCALIZER{loc_tag} (deterministic, from metrics):\n{loc_text}" if loc_text else ""
     pre_text, pre_s = "", 0.0
     if f.preflight:                                   # code only, no tokens; counted in wall time (and so in MTTR)
         tp = time.time()
         pre_text, pre_s = preflight(), round(time.time() - tp, 2)
         tracer.note("🛫", f"pre-flight ({pre_s}s, {len(pre_text)} chars): {pre_text[:300] or 'nothing to report'}", event="preflight", seconds=pre_s, chars=len(pre_text))
-    pre_block = f"\n\nPRE-FLIGHT (collected by code, no model):\n{pre_text}" if pre_text else ""
+    pre_tag = f" [{H.observe('preflight', ('logs', 'cluster'), pre_text)}]" if f.hypothesis and pre_text else ""   # ONE logs + ONE cluster signal
+    pre_block = f"\n\nPRE-FLIGHT{pre_tag} (collected by code, no model):\n{pre_text}" if pre_text else ""
     actions: list[dict] = []
     result = agent.invoke({"messages": [{"role": "user", "content":
                           f"ALERT: {alert}\n\nDETECTOR SNAPSHOT (taken just now): {snapshot_line()}{loc_block}{pre_block}"}]}, cfg)
@@ -67,9 +74,17 @@ def run_alert(alert: str, auto_approve: bool = False, ask=input, on_start=None, 
     rag_hit = incident.recalled()                     # set by search_incidents itself when it returned a past incident
     stats = tracer.summary()
     bud = budget.state() if f.budget else None
+    ledger = H.snapshot() if f.hypothesis else None
+    if ledger:
+        d = ledger["diagnosis"]
+        tracer.note("🧩", f"hypothesis ledger: {len(ledger['hypotheses'])} hypotheses, {len(ledger['observations'])} observations, diagnosis={d['state']}, "
+                          f"remediation requests refused={ledger['gate_blocked']}", event="hypotheses", ledger=ledger)
     tracer.note("🏁", f"done in {round(time.time() - t0)}s | llm_calls={stats['llm_calls']} tool_calls={stats['tool_calls']} "
                       f"tokens={stats['tokens_in']}→{stats['tokens_out']} rag_hit={rag_hit}"
                       + (f" budget={bud['used']}/{bud['cap']} blocked={bud['blocked']}" if bud else ""), event="done")
-    return {"stats": stats, "final": msgs[-1].content if isinstance(msgs[-1].content, str) else str(msgs[-1].content),
+    final = msgs[-1].content if isinstance(msgs[-1].content, str) else str(msgs[-1].content)
+    if f.hypothesis:
+        final += H.final_note()                       # the ledger as code computed it + a warning when no cause is confirmed
+    return {"stats": stats, "final": final,
             "actions": actions, "rag_hit": rag_hit, "seconds": round(time.time() - t0),
-            "features": f.as_dict(), "tuning": t.as_dict(), "models": models, "localizer_s": loc_s, "preflight_s": pre_s, "budget": bud, "saved_ids": incident.saved_ids()}
+            "features": f.as_dict(), "tuning": t.as_dict(), "models": models, "localizer_s": loc_s, "preflight_s": pre_s, "budget": bud, "saved_ids": incident.saved_ids(), "hypotheses": ledger}

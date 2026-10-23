@@ -6,6 +6,7 @@ from langchain.agents.middleware import ModelRetryMiddleware, TodoListMiddleware
 from langgraph.checkpoint.memory import MemorySaver
 
 from . import budget
+from . import hypothesis as H
 from .config import NAMESPACE, TOPOLOGY, METRICS
 from .features import Features, from_env
 from .tuning import Tuning, active as active_tuning
@@ -112,6 +113,19 @@ SUB_COMPACT_K8S = " If rollout_diff showed changes, add a `DIFF:` block with its
 SUB_PRELOADED = (" The question may already contain the metrics, log patterns or events you would normally collect first: use them, do not collect "
                  "them again; spend your calls on what the question leaves unknown.")
 
+# ---- hypothesis-driven investigation (prompt side). Added ONLY when the feature is on, so the off prompt is byte-for-byte the old one.
+HYPOTHESIS_PROMPT = """
+
+HYPOTHESIS LEDGER (code-kept and code-scored; with active symptoms it replaces the 'ONE root-cause statement' of step 3):
+1. Before delegating, call propose_hypothesis for 2-4 COMPETING explanations that predict DIFFERENT observable things (e.g. a victim of a deeper failure vs the deeper failure itself; a change vs a capacity limit vs a dependency fault). Ideas may come from the alert, LOCALIZER / PRE-FLIGHT facts or recalled incidents (set source). Each needs 1-4 predictions "if true, <what a tool would show>", at least one that would REFUTE it if absent. Do not propose what the inspectors' tools cannot check.
+2. Call hypothesis_ledger: NEXT TESTS lists the predictions that best tell the live hypotheses apart. Delegate those (in parallel when independent). Give each inspector the prediction and ask: REFUTED or SURVIVES first, then the numbers, citing the [O#] id of each tool result behind a fact.
+3. Record every outcome with record_evidence (hypothesis, prediction, confirmed | violated | unclear, the [O#] ids). Ids are on tool results and on the LOCALIZER / PRE-FLIGHT headers; anything else is rejected. Record what the data shows, never what an inspector believes.
+4. Status and confidence are computed by code: supported = confirmed predictions from at least two different signal types and none violated; one violated prediction refutes. Your own confidence, a recalled incident or a plausible story count for nothing.
+5. Call hypothesis_ledger before any fix. Delegating to the remediator is refused unless exactly one hypothesis is supported and no rival is untested. If you cannot get there (budget, no data), do not name a root cause: report the leading hypotheses, what is confirmed and what is unchecked, and escalate to a human.
+6. Final answer: call the cause a root cause only if the ledger says confirmed; otherwise 'most likely (unconfirmed)'. List each hypothesis with its status and the observation that supports or refutes it."""
+SUB_HYPOTHESIS = (" Every tool result starts with an id such as [O7]. When asked to test a prediction, start with REFUTED or SURVIVES, then give each fact with the"
+                  " id(s) of the tool result(s) it came from. Cite only ids you actually saw; if a tool returned nothing useful say 'no data', do not guess.")
+
 # Keeps inspectors short and focused on the symptom window, so a healthy system is not combed for old noise.
 # The numbers (calls per inspector, report words) are the run's Tuning; the defaults below reproduce the original prompts exactly.
 BUDGET = (" Budget: at most 8 tool calls. The tools already limit data to the current incident window (symptom onset minus 2 minutes);"
@@ -143,6 +157,10 @@ _SUBAGENTS = [
 
 
 budget.READ_TOOLS = frozenset(t.name for t in [*PROM_TOOLS, *LOKI_TOOLS, *TEMPO_TOOLS, *K8S_READ_TOOLS] if t.name != "current_problems")
+# Signal type of each read tool, for the hypothesis ledger (same source of truth as the budget: a new read tool is classified automatically).
+H.SIGNAL_OF.update({**{t.name: "metrics" for t in PROM_TOOLS if t.name != "current_problems"}, **{t.name: "logs" for t in LOKI_TOOLS},
+                    **{t.name: "traces" for t in TEMPO_TOOLS}, **{t.name: "cluster" for t in K8S_READ_TOOLS}, "get_pod_logs": "logs"})
+H.WRITE_NAMES = frozenset(t.name for t in WRITE_TOOLS)
 
 
 def make_subagents(f: Features, t: Tuning | None = None) -> list[dict]:
@@ -165,6 +183,12 @@ def make_subagents(f: Features, t: Tuning | None = None) -> list[dict]:
             sa["middleware"].append(LeanTools(SUBAGENT_DROP))
         if f.budget:
             sa["middleware"].append(budget.ToolBudget())
+        if f.hypothesis:
+            if inspector:
+                sa["system_prompt"] += SUB_HYPOTHESIS
+                sa["middleware"].append(H.ObservationRecorder())    # inside ToolBudget: a refused call is not an observation
+            else:
+                sa["middleware"].append(H.RemediationGate())        # second line: the write tools themselves
         if sub_model is not None:
             sa["model"] = sub_model
         out.append(sa)
@@ -193,7 +217,7 @@ def _metrics_block() -> str:
 def system_prompt(f: Features | None = None) -> str:
     f = f or from_env()
     extra = ((LOCALIZER_PROMPT if f.localizer else "") + (FALSIFY_PROMPT if f.falsify else "") + (PREFLIGHT_PROMPT if f.preflight else "")
-             + (COMPACT_PROMPT if f.compact_reports else "") + (BUDGET_PROMPT if f.budget else ""))
+             + (COMPACT_PROMPT if f.compact_reports else "") + (BUDGET_PROMPT if f.budget else "") + (HYPOTHESIS_PROMPT if f.hypothesis else ""))
     base = SYSTEM_PROMPT.replace(TRIAGE_ORIG, TRIAGE_PREFLIGHT) if f.preflight else SYSTEM_PROMPT
     return (base.replace("<<NAMESPACE>>", NAMESPACE).replace("<<TOPOLOGY>>", _topology_block())
             .replace("<<METRICS>>", _metrics_block()).replace("<<RECALL>>", RECALL_ON if f.memory else RECALL_OFF)
@@ -202,11 +226,11 @@ def system_prompt(f: Features | None = None) -> str:
 
 def build_agent(f: Features | None = None, t: Tuning | None = None):
     f = f or from_env()
-    extra_mw = ([LeanTools(ORCHESTRATOR_DROP)] if f.lean_tools else []) + ([budget.ToolBudget()] if f.budget else [])
+    extra_mw = ([LeanTools(ORCHESTRATOR_DROP)] if f.lean_tools else []) + ([budget.ToolBudget()] if f.budget else []) + ([H.RemediationGate()] if f.hypothesis else [])
     return create_deep_agent(
         model=get_llm(),
         system_prompt=system_prompt(f),
-        tools=(RAG_TOOLS if f.memory else []) + [current_problems],   # orchestrator: memory (optional) + quick symptom check; no direct cluster access
+        tools=(RAG_TOOLS if f.memory else []) + [current_problems] + (H.TOOLS if f.hypothesis else []),   # orchestrator: memory (optional) + quick symptom check (+ the hypothesis ledger); no direct cluster access
         subagents=make_subagents(f, t),
         skills=["/skills/"],
         backend=FilesystemBackend(root_dir=_sandbox(), virtual_mode=True),

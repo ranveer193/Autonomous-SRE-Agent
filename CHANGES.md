@@ -1,3 +1,13 @@
+## Eval harness: effect-based scoring, dev/held-out split, scenario-overlap leak test
+- `eval/effects.py` (new, pure functions): the harness snapshots the writable deployments before and after the agent runs and scores from the
+  difference (restart / scale / resources up-down / env / rollout), not from the report's wording. Code decides: forbidden writes, "escalate"
+  scenarios with any write, restart-only on a "fix" scenario (unconfirmed). The judge gets the effects and returns `claims_unsupported`.
+- `eval/run_scenario.py`: effects in every result file (`effects`, `scored`); after a successful agent fix the harness now calls the state-aware
+  `faultctl recover` (stops the fault keeper, clears leftover in-process faults, skips a rollout undo the agent already did).
+- `eval/run_suite.py`: `--split dev|heldout|all`; status comes from `effects.case_status`; report shows a restart-only column.
+- `tests_guards.py`: 8-word scenario-overlap test (fails when agent code, prompts or skills share a run with any scenario text), scenario fault-key
+  test, and offline tests of effects and scoring.
+
 # Phase 3 changes: run isolation, memory correctness, no leaks to the agent
 
 Everything here sits on top of the version you uploaded (which already had `incident.py`, the evidence-board localizer, tool-recorded memory and the
@@ -100,3 +110,24 @@ value produced it. New `sre_agent/tuning.py`: a small `Tuning` value passed next
 - Tests: `python tests_tuning.py` (64 checks) and 16 new checks in `node tests_ui.js`. The form was also driven in a simulated DOM (fields, typed values sent, bad values blocked, reset, compare mode), but not in a real browser.
 - Not exposed: `SRE_TOOL_MAX_CHARS` (still unwired, see "Found, not changed" in Phase 4). A knob that does nothing would mislead.
 - Not added to the Investigate tab: the API already accepts `tuning` for single runs; only the suite form has the inputs, as asked.
+
+# Hypothesis-driven investigation (switchable, off by default)
+
+Details and settings: README, "Hypothesis-driven investigation". Tests: `python tests_hypothesis.py` (117 checks, no cluster, no LLM), `node tests_ui.js` (+14 checks).
+Not run against a live cluster or a real model: whether a model follows the ledger protocol, and what it does to accuracy, tokens and MTTR, is unmeasured. Use the opt-in arm
+`hypothesis-driven` against `memory`.
+
+| file | change |
+|---|---|
+| `sre_agent/hypothesis.py` (new) | ledger (hypotheses, predictions, evidence), observation registry + `ObservationRecorder` middleware, computed status / confidence / diagnosis, `next_tests`, three orchestrator tools, `RemediationGate` middleware, `final_note` |
+| `sre_agent/features.py` | `Features.hypothesis` (LAST field, default off, env `SRE_HYPOTHESIS`); opt-in arm `hypothesis-driven` (not in `DEFAULT_ARMS`) |
+| `sre_agent/agent.py` | ledger prompt (appended to the orchestrator prompt only when on), inspector citation rule, tools, recorder on inspectors (inside the budget), gate on the orchestrator and the remediator; signal type per read tool from the same tool lists the budget uses |
+| `sre_agent/runner.py` | ledger reset per run; LOCALIZER / PRE-FLIGHT blocks get an `[O#]` id when on; `hypotheses` in the result; ledger + warning appended to the final answer when on |
+| `api.py` | `hypotheses` in the run result; `GET /api/runs/{id}/hypotheses` (final or live) |
+| `ui/index.html` | toggle in the existing technique list (Investigate and failure-test forms); ledger panel (`hypothesisHtml`), fetched only for runs started with the toggle |
+| `eval/run_scenario.py` | `hypotheses` stored in each run result (additive key) |
+| tests | `tests_hypothesis.py` (new), `tests_ui.js` |
+
+Compatibility: no existing function signature, API route, tuning field or saved-result field changed. Added: one `Features` field (default off), one key in the run result (`hypotheses`, `None` when off),
+one route. OFF is identical to before: orchestrator prompt, subagent prompts, middleware lists and tools hash the same as the uploaded version over all 256 combinations of the other techniques.
+

@@ -28,6 +28,9 @@ BASE_BEFORE_S = 60               # 'before' = the 5 minutes ending this long bef
 _pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="evidence")
 
 
+_failed_queries: list[str] = []                      # filled per collect(); a failed query is NOT the same as 'no anomaly'
+
+
 def _rows(q: str, *labels: str) -> dict:
     out = {}
     try:
@@ -36,7 +39,8 @@ def _rows(q: str, *labels: str) -> dict:
             if v == v:                                    # drop NaN
                 out[tuple(s["metric"].get(l, "?") for l in labels)] = v
     except Exception as e:
-        logger.debug("evidence query failed: %s", e)
+        _failed_queries.append(q[:80])
+        logger.warning("evidence query failed (%s): %s", type(e).__name__, e)
     return out
 
 
@@ -47,6 +51,7 @@ def _dep_of(pod: str, deployments: set) -> str:
 
 def collect(now: float | None = None) -> dict:
     now = now or time.time()
+    _failed_queries.clear()
     sl, ns = M["service_label"], f'namespace="{NAMESPACE}"'
     age = incident.age_s(now)
     w = f"{incident.rate_window_s(5, now)}s"                         # the incident so far
@@ -75,7 +80,7 @@ def collect(now: float | None = None) -> dict:
     q["restarts"] = (f'increase(kube_pod_container_status_restarts_total{{{ns}}}[{rw}]) > 0', ("pod",))
     q["rollout"] = (f'max by (owner_name) (kube_replicaset_created{{{ns}}} * on (namespace, replicaset) group_left(owner_name) '
                     f'kube_replicaset_owner{{{ns}, owner_kind="Deployment"}})', ("owner_name",))
-    res = dict(zip(q, _pool.map(lambda k: _rows(*q[k]), q)))
+    res = dict(zip(q, _pool.map(lambda k: _rows(q[k][0], *q[k][1]), q)))   # (promql, labels) -> _rows(promql, *labels)
 
     def merge(*keys_fields):
         out: dict = {}
@@ -114,6 +119,7 @@ def _was(cur: str, base) -> str:
 def build(d: dict) -> dict:
     """Pure. Returns {'facts': {component: [fact, ...]}, 'quiet': [component, ...]}. Alphabetical, no scoring."""
     svc, edges, desired = d["svc"], d["edges"], d.get("desired", {})
+    edges = {k: v for k, v in edges.items() if isinstance(k, tuple) and len(k) == 2}
     nodes = set(svc) | set(d.get("deployments", ())) | {n for e in edges for n in e}
     facts: dict[str, list[str]] = {}
 
@@ -133,7 +139,8 @@ def build(d: dict) -> dict:
             add(n, f"{want - ready} of {want} replica(s) not ready")
     for n, k in d.get("restarts", {}).items():
         add(n, f"{k} container restart(s) inside the incident window")
-    for (a, b), v in sorted(edges.items()):
+    for key, v in sorted((k, v) for k, v in edges.items() if isinstance(k, tuple) and len(k) == 2):
+        a, b = key
         if _edge_bad(v):
             parts = [t for t in (f"errors {v['err']:.2f}/s" if v.get("err", 0) > EDGE_ERR_PER_S else "",
                                  f"p95 {v['p95']:.2f}s" if v.get("p95", 0) > P95_SECONDS else "") if t]
@@ -161,17 +168,29 @@ def render(b: dict, window: str = "") -> str:
     for n, fs in b["facts"].items():
         L.append(f"- {n}: " + "; ".join(fs))
     if b["quiet"]:
-        L.append("No anomaly in the metrics: " + ", ".join(b["quiet"]))
+        L.append("No metric crossed a threshold (not a statement that they are healthy): " + ", ".join(b["quiet"]))
     if b.get("rollouts"):
         L.append("Latest rollout of each deployment, relative to symptom onset (negative = before the symptoms began; a restart counts as a rollout): "
                  + ", ".join(f"{n} {t}" for n, t in b["rollouts"]))
     return "\n".join(L)
 
 
-def localize() -> str:
-    """Never raises. Returns '' when nothing is anomalous (healthy system: do not bias the agent)."""
+def localize_ex() -> tuple[str, str]:
+    """Never raises. Returns (text, status). The board only lays out facts; it never decides that the system is fine or broken.
+    status: 'facts'      -> text holds the observations
+            'no_facts'   -> queries worked, no metric crossed a threshold (the model still investigates; this is not a health verdict)
+            'incomplete' -> some queries failed, so absence of facts proves nothing
+            'error'      -> the board itself failed"""
     try:
-        return render(build(collect()), incident.describe_window())
+        text = render(build(collect()), incident.describe_window())
     except Exception as e:
         logger.warning("evidence board failed: %s: %s", type(e).__name__, e)
-        return ""
+        return "", "error"
+    if _failed_queries and not text:
+        return "", "incomplete"
+    return text, ("facts" if text else "no_facts")
+
+
+def localize() -> str:
+    """Never raises. Returns '' when there are no facts to show (healthy system: do not bias the agent)."""
+    return localize_ex()[0]

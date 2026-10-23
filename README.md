@@ -163,6 +163,32 @@ A technique switch says *which* technique is on; tuning says *how much*. Seven n
 At the defaults nothing changes: every prompt is identical to before. `python tests_tuning.py` checks it offline.
 
 
+## Hypothesis-driven investigation (switchable, off by default)
+
+Tick **Hypothesis-driven investigation** on the Investigate tab (or in the failure-test form), pass `--features hypothesis` (or `SRE_HYPOTHESIS=1`), or compare the
+opt-in arm `hypothesis-driven` (= localizer + falsify + memory + hypothesis). Off = the investigation exactly as before (checked: identical prompts, tools and
+middleware for all 256 combinations of the other techniques).
+
+What changes when it is on (`sre_agent/hypothesis.py`):
+- The orchestrator keeps a **ledger** of 2-4 competing hypotheses (`propose_hypothesis`), each with observable predictions. It picks the checks that tell them apart
+  (`hypothesis_ledger` lists NEXT TESTS: per live hypothesis, the untested prediction its rivals share least) and records outcomes with `record_evidence`.
+- **Evidence is tool-grounded.** Every successful read-tool result is stamped `[O7]` and tagged with its signal type (metrics / logs / traces / cluster) by a
+  middleware; the LOCALIZER and PRE-FLIGHT headers carry ids too. `record_evidence` accepts only existing ids, so a recalled incident, the model's reasoning or an
+  invented observation cannot be evidence. The model still judges whether an observation confirms or violates a prediction; code checks provenance and counts.
+- **Status and confidence are computed, never asked for.** refuted = a violated prediction backed by an observation; supported = confirmed predictions from at least
+  2 different signal types and none violated. The model's `stated_confidence` is stored and displayed, and is not an input to anything.
+- **Diagnosis** = `confirmed` only when exactly one hypothesis is supported and no rival is untested (otherwise `insufficient_hypotheses`, `unsupported`, `contested`,
+  `rivals_untested`). **A fix is refused until then**: the `task` call to the remediator is blocked before any approval prompt, and the write tools are blocked a second
+  time inside the remediator. Reads, `verify_resolved`, memory and the plan are never blocked.
+- The final answer gets the ledger appended, and a `NOT CONFIRMED` warning when the diagnosis is not confirmed.
+
+Settings (env, lenient; defaults in brackets): `SRE_HYPOTHESIS_MIN_SIGNALS` (2), `SRE_HYPOTHESIS_MIN_COUNT` (2), `SRE_HYPOTHESIS_REFUTE_MIN` (1, observations needed to refute),
+`SRE_HYPOTHESIS_GATE` (1; `0` = the gate only advises). The API serves the ledger at `GET /api/runs/<id>/hypotheses` (live while running) and in the run result (`hypotheses`);
+the console shows it as a panel under the plan. Tests: `python tests_hypothesis.py` (117 checks) and the `ledger` / `toggle` checks in `node tests_ui.js`.
+
+Trade-off to know: with the gate on, an agent that never builds a ledger cannot change anything. That is the point for unsupported diagnoses, but it also holds back an
+urgent mitigation (e.g. a restart) until a cause is confirmed. Use `SRE_HYPOTHESIS_GATE=0` if you want the ledger without the block.
+
 ## Leakage and portability audit (latest)
 
 - **Runbooks no longer carry scenario answers**: removed the copied error string, hostname hint, hard-coded 512 MiB, "DBA", `/health` vs `/ready` and "unknown ids" wording. `tests_guards.py` now bans these phrases and fails if agent code or skills mention `ground_truth` or `faultctl`.

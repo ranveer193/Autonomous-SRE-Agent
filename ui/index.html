@@ -306,6 +306,7 @@ details.scase .body{padding:0 12px 10px}
       <div class="prog" id="runProg"><i></i></div>
       <div class="stats" id="runStats"></div>
       <div id="todoBox"></div>
+      <div id="hypBox"></div>
       <h3>Agents</h3>
       <div class="panel" id="agentsBox"></div>
       <div id="final"></div>
@@ -429,6 +430,21 @@ function modelsHtml(rows){
 }
 /* Arm-by-arm comparison. `cmp` = report.json "comparison": {arm: {runs, recovered, mttr_s, root_cause_acc, distractor_rate, tokens, tokens_main, ...}}.
    The best value in each column is bold; lower is better except root-cause accuracy. A dash means no data. */
+/* Hypothesis ledger (feature "hypothesis"). `r` = {enabled, ledger} from /api/runs/<id>/hypotheses. Every server string is escaped. */
+function hypothesisHtml(r){
+  if(!r||!r.enabled)return"";
+  const L=r.ledger;
+  if(!L||!(L.hypotheses||[]).length)return`<div class="panel"><b>Hypothesis ledger</b><div class="muted">Hypothesis-driven investigation is on. No hypotheses recorded yet.</div></div>`;
+  const cls={supported:"ok",refuted:"crit",testing:"warn",proposed:""},d=L.diagnosis||{},res={confirmed:"✓",violated:"✕"};
+  const rows=L.hypotheses.map(h=>{
+    const preds=h.predictions.map(p=>{const v=(h.prediction_results||{})[p.id];return`<li><span class="${v==="confirmed"?"ok":v==="violated"?"crit":"muted"}">${res[v]||"○"}</span> <span class="muted">${esc(p.id)}</span> ${esc(p.text)}</li>`}).join("");
+    return`<tr><td><b>${esc(h.id)}</b></td><td>${esc(h.statement)}${h.component?` <span class="muted">[${esc(h.component)}]</span>`:""}<ul class="todos">${preds}</ul></td><td><span class="chip ${cls[h.status]||""}">${esc(h.status)}</span></td><td>${Math.round((h.confidence||0)*100)}%</td><td>${esc((h.signals||[]).join(", ")||"–")}</td><td class="muted">${esc(h.source)}</td></tr>`}).join("");
+  const next=(L.next_tests||[]).length?`<p class="muted" style="margin:8px 0 0">Next tests: ${L.next_tests.map(t=>esc(t.hypothesis)+"/"+esc(t.prediction)).join(", ")}</p>`:"";
+  const blocked=L.gate_blocked?`<p class="warn" style="margin:8px 0 0">${L.gate_blocked} fix request(s) were refused because no cause was confirmed.</p>`:"";
+  return`<div class="panel"><b>Hypothesis ledger</b> <span class="chip ${d.allowed?"ok":"warn"}">diagnosis: ${esc(d.state||"?")}</span>
+  <div class="muted" style="margin:4px 0 8px">${esc(d.reason||"")}. Status and confidence are computed from tool observations, not from the model's own confidence.</div>
+  <div class="scroll"><table><thead><tr><th></th><th>hypothesis and predictions</th><th>status</th><th>confidence</th><th>signal types</th><th>from</th></tr></thead><tbody>${rows}</tbody></table></div>${next}${blocked}</div>`;
+}
 function compareHtml(cmp){
   const arms=Object.keys(cmp||{});if(!arms.length)return"";
   const pct=v=>v==null?"–":Math.round(v*100)+"%",num=v=>v==null?"–":fmtTok(Math.round(v)),sec=v=>v==null?"–":Math.round(v)+" s";
@@ -762,6 +778,7 @@ async function tickRun(){
       $("#apTool").textContent=m?m[1]:"change";$("#apHint").textContent=m?(TOOLHINT[m[1]]||""):"";$("#apArgs").textContent=m?m[2]:r.pending;
     }
     if(r.log){const d=await api(`/api/logs/${r.log}/events?after=${evNext}`);if(d.events.length){evs=evs.concat(d.events);evNext=d.next}}
+    if(r.features&&r.features.hypothesis){try{$("#hypBox").innerHTML=hypothesisHtml(await api(`/api/runs/${r.id}/hypotheses`))}catch(e){}}else $("#hypBox").innerHTML="";
     if(r.result){
       const x=r.result;
       $("#final").innerHTML=`<div class="panel"><h3 style="margin-top:0">Final report</h3><div style="white-space:pre-wrap">${esc(x.final)}</div>
@@ -774,7 +791,8 @@ async function tickRun(){
 setInterval(()=>{if(lastRun&&!lastRun.result&&!lastRun.error&&tab==="run"){const m=buildTrace(evs);$("#runStats").innerHTML=statsHtml(m.st,Date.now()/1000-lastRun.started)}},1000);
 /* Techniques: each one can be switched on or off per run. Defaults come from the server (env). */
 const FEATS=[["localizer","Localizer","metrics facts per component, computed by code before the model starts (observations, no ranking)"],["falsify","Falsify","refute each claim with one cheap check before digging"],["memory","Memory","recall and save past incidents"],
-["preflight","Pre-flight","code collects log patterns and warning events first; the model skips its triage round trips (cost)"],["cluster_logs","Cluster logs","log search returns message patterns with counts instead of raw lines (cost)"],["lean_tools","Lean tools","hide file tools the phase does not need, shorten the todo tool (cost)"],["compact_reports","Compact reports","inspectors answer in a short fixed format (cost)"],["budget","Budget","cap on investigation tool calls per incident + stop when two signals agree (cost)"]];
+["preflight","Pre-flight","code collects log patterns and warning events first; the model skips its triage round trips (cost)"],["cluster_logs","Cluster logs","log search returns message patterns with counts instead of raw lines (cost)"],["lean_tools","Lean tools","hide file tools the phase does not need, shorten the todo tool (cost)"],["compact_reports","Compact reports","inspectors answer in a short fixed format (cost)"],["budget","Budget","cap on investigation tool calls per incident + stop when two signals agree (cost)"],
+["hypothesis","Hypothesis-driven investigation","competing hypotheses in a ledger scored by code from tool observations; a fix is refused until one cause is confirmed (off = the usual investigation)"]];
 let featInfo=null;
 const featBoxes=(cls,on)=>FEATS.map(([k,l,t])=>`<label style="margin:0" title="${esc(t)}"><input type="checkbox" class="${cls}" value="${k}" ${on[k]?"checked":""}> ${l}</label>`).join("");
 const featVals=cls=>Object.fromEntries(FEATS.map(([k])=>[k,!!document.querySelector(`.${cls}[value="${k}"]`)?.checked]));

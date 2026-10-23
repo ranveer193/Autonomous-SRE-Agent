@@ -3,7 +3,7 @@
 const fs = require("fs"), path = require("path"), vm = require("vm");
 const html = fs.readFileSync(path.join(__dirname, "ui", "index.html"), "utf8");
 const src = /<script id="pure">([\s\S]*?)<\/script>/.exec(html)[1];
-const ctx = {}; vm.createContext(ctx); vm.runInContext(src + "\nthis.api={buildTrace,traceHtml,agentsHtml,statsHtml,rawRow,esc,compareHtml,modelsHtml,stepsHtml,tuningHtml,tuningCheck};", ctx);
+const ctx = {}; vm.createContext(ctx); vm.runInContext(src + "\nthis.api={buildTrace,traceHtml,agentsHtml,statsHtml,rawRow,esc,compareHtml,modelsHtml,stepsHtml,tuningHtml,tuningCheck,hypothesisHtml};", ctx);
 const { buildTrace, traceHtml, agentsHtml, statsHtml, rawRow } = ctx.api;
 let bad = 0; const ok = (n, c, d = "") => { console.log((c ? "PASS " : "FAIL ") + n + (c ? "" : "  " + d)); if (!c) bad++; };
 
@@ -95,6 +95,36 @@ ok("range limits themselves are accepted", ctx.api.tuningCheck({ tool_budget: "1
 ok("a fraction, text or exponent is refused (the server refuses them too)", ["2.5", "abc", "1e2", "--3", "3 4"].every(v => /whole number/.test(ctx.api.tuningCheck({ tool_budget: v }, SPEC).error)));
 ok("an unknown setting is refused", /unknown/.test(ctx.api.tuningCheck({ speed: "9" }, SPEC).error));
 ok("a refused form sends no values at all", Object.keys(ctx.api.tuningCheck({ tool_budget: "20", report_words: "9999" }, SPEC).values).length === 0);
+// ---- hypothesis ledger panel (feature "hypothesis")
+const hy = ctx.api.hypothesisHtml;
+const L = {
+  hypotheses: [
+    { id: "H1", statement: "store <b>refuses</b> connections", component: "st<i>ore", source: "observation", status: "supported", confidence: 0.83, signals: ["logs", "metrics"],
+      predictions: [{ id: "P1", text: "logs show <script>x</script>" }, { id: "P2", text: "pod not ready" }], prediction_results: { P1: "confirmed", P2: "confirmed" } },
+    { id: "H2", statement: "front overloaded", component: "", source: "memory", status: "refuted", confidence: 0, signals: [],
+      predictions: [{ id: "P1", text: "cpu saturated" }, { id: "P2", text: "rate high" }], prediction_results: { P1: "violated", P2: null } }],
+  diagnosis: { state: "confirmed", allowed: true, reason: "H1 is supported by logs, metrics and every rival is refuted or tested" },
+  next_tests: [{ hypothesis: "H2", prediction: "P2", text: "rate high" }], gate_blocked: 0,
+};
+ok("ledger: toggle OFF (or no run) renders nothing", hy(null) === "" && hy({ enabled: false, ledger: null }) === "" && hy(undefined) === "");
+ok("ledger: ON but nothing recorded yet says so", /No hypotheses recorded yet/.test(hy({ enabled: true, ledger: null })) && /No hypotheses recorded yet/.test(hy({ enabled: true, ledger: { hypotheses: [] } })));
+let hh = hy({ enabled: true, ledger: L });
+ok("ledger: one row per hypothesis with status, confidence and signal types", (hh.match(/<tr><td><b>H\d/g) || []).length === 2 && hh.includes(">supported<") && hh.includes(">refuted<") && hh.includes("83%") && hh.includes("logs, metrics"));
+ok("ledger: prediction outcomes are marked (confirmed / violated / untested)", hh.includes("✓") && hh.includes("✕") && hh.includes("○"));
+ok("ledger: statuses and diagnosis are colour-coded with the existing chips", /chip ok">supported/.test(hh) && /chip crit">refuted/.test(hh) && /chip ok">diagnosis: confirmed/.test(hh));
+ok("ledger: model text (statements, components, predictions) is escaped", !hh.includes("<b>refuses</b>") && !hh.includes("<script>x") && !hh.includes("<i>ore") && hh.includes("&lt;b&gt;refuses"));
+ok("ledger: says confidence is computed from tool observations, not from the model", /computed from tool observations/.test(hh));
+ok("ledger: next tests are listed", hh.includes("Next tests: H2/P2"));
+ok("ledger: no refusal line when nothing was refused", !/refused because no cause/.test(hh));
+const L2 = { ...L, diagnosis: { state: "unsupported", allowed: false, reason: "no hypothesis has confirmed predictions" }, gate_blocked: 2 };
+hh = hy({ enabled: true, ledger: L2 });
+ok("ledger: unconfirmed diagnosis is shown as a warning, and refused fix requests are counted", /chip warn">diagnosis: unsupported/.test(hh) && /2 fix request\(s\) were refused/.test(hh));
+ok("ledger: a ledger from an older/partial payload does not throw", (() => { try { return typeof hy({ enabled: true, ledger: { hypotheses: [{ id: "H1", statement: "s", predictions: [], status: "proposed" }] } }) === "string"; } catch (e) { return false; } })());
+// the toggle itself: listed once, in the same list that feeds both forms
+const feats = [...html.matchAll(/\["(\w+)","[^"]+","[^"]+"\]/g)].map(m => m[1]).filter(k => ["localizer","falsify","memory","preflight","cluster_logs","lean_tools","compact_reports","budget","hypothesis"].includes(k));
+ok("toggle: 'hypothesis' appears exactly once in the technique list, after the existing ones", feats.filter(k => k === "hypothesis").length === 1 && feats[feats.length - 1] === "hypothesis" && feats.length === 9, feats.join());
+ok("toggle: the Investigate request still sends every toggle", /api\("\/api\/runs",\{alert:\$\("#alert"\)\.value,auto_approve:\$\("#auto"\)\.checked,features:featVals\("rf"\)\}\)/.test(html));
+ok("toggle: the ledger is fetched only for runs started with it", /r\.features&&r\.features\.hypothesis/.test(html) && /\/api\/runs\/\$\{r\.id\}\/hypotheses/.test(html));
 // ---- the page's browser-only script must at least parse (the pure block above is the only part executed here)
 const scripts = [...html.matchAll(/<script(?: id="pure")?>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 let parsed = true; try { scripts.forEach(sc => new vm.Script(sc)); } catch (e) { parsed = false; console.log(e.message); }

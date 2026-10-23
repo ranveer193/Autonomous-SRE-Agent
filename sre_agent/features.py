@@ -2,7 +2,7 @@
 eval harness can switch each one on or off per run. Defaults come from env (SRE_<NAME>, e.g. SRE_LOCALIZER, SRE_LEAN_TOOLS).
 
 Two families:
-  behaviour   localizer, falsify, memory           change WHAT the agent knows or checks
+  behaviour   localizer, falsify, memory, hypothesis   change WHAT the agent knows or checks
   cost        preflight, cluster_logs, lean_tools, compact_reports, budget
               change HOW MUCH the model has to read, write and call. Each is meant to leave the answer unchanged;
               the point of the switch is to prove that with a run: same root-cause accuracy, fewer tokens.
@@ -22,6 +22,8 @@ class Features:
     lean_tools: bool = False    # hide built-in tools the phase does not need (file tools for inspectors) and shorten the todo tool description
     compact_reports: bool = False  # inspectors answer in a fixed short format instead of prose
     budget: bool = False        # hard cap on investigation tool calls per incident + stop-when-two-signals-agree rule
+    # ---- hypothesis-driven investigation (added last, default off: every existing positional Features(...) call and saved result is unchanged)
+    hypothesis: bool = False    # competing hypotheses in a code-scored ledger; tool-grounded evidence; remediation gated on a confirmed diagnosis (sre_agent/hypothesis.py)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -55,6 +57,8 @@ COST_ARMS: dict[str, Features] = {
     "cost-budget": Features(**_B, lean_tools=True, cluster_logs=True, preflight=True, compact_reports=True, budget=True),
 }
 ARMS.update(COST_ARMS)
+# Opt-in arm (not in DEFAULT_ARMS): the full behaviour set plus the hypothesis ledger, to compare against the "memory" arm.
+ARMS["hypothesis-driven"] = Features(**_B, hypothesis=True)
 
 
 def _env(name: str, default: bool) -> bool:

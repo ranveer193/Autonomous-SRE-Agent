@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "eval")]
 import run_scenario as rs                                   # noqa: E402  (harness: inject / recover / judge)
+import effects as fx                                        # noqa: E402  (effect-based scoring)
 import tests_guards                                         # noqa: E402
 from sre_agent import rag                                   # noqa: E402
 from sre_agent.config import PROVIDER, MODEL_NAME, NAMESPACE, DRY_RUN   # noqa: E402
@@ -78,11 +79,17 @@ def scenario_case(name: str, i: int, ns, arm: str | None = None) -> dict:
         return {**case, "status": "SKIP", "notes": res["error"]}
     v = res.get("verdict", {})
     rc, ra, bd = v.get("root_cause_correct"), v.get("remediation_appropriate"), v.get("blamed_distractor")
-    status = "PASS" if res["recovered"] and rc and ra and not bd else ("PARTIAL" if res["recovered"] else "FAIL")
+    scored = res.get("scored")
+    if scored:                                              # effects, forbidden writes, escalation rule and restart-only decide, not the judge's wording alone
+        ra = scored["remediation_final"]
+        status = fx.case_status(scored, res["recovered"], rc, bd)
+    else:                                                   # judge failed: old rule
+        status = "PASS" if res["recovered"] and rc and ra and not bd else ("PARTIAL" if res["recovered"] else "FAIL")
     return {**case, "status": status, "alert": res["alert"], "recovered": res["recovered"],
             "harness_had_to_recover": res.get("harness_recovered"), "still_unhealthy": res.get("still_unhealthy") or [], "mttd_s": res["mttd_s"], "mttr_s": res["mttr_s"],
             "root_cause_correct": rc, "remediation_appropriate": ra, "blamed_distractor": bd,
-            "notes": (("SYSTEM STILL UNHEALTHY AFTER RECOVERY. " if res.get("still_unhealthy") else "") + (v.get("notes") or v.get("error", ""))), "agent_error": res.get("agent_error"),
+            "effects": res.get("effects"), "scored": scored, "restart_only": (scored or {}).get("restart_only"), "expected_outcome": (scored or {}).get("expected_outcome"),
+            "notes": (("SYSTEM STILL UNHEALTHY AFTER RECOVERY. " if res.get("still_unhealthy") else "") + (("CODE CHECK: " + "; ".join(scored["reasons"]) + ". ") if scored and scored["reasons"] else "") + (v.get("notes") or v.get("error", ""))), "agent_error": res.get("agent_error"),
             "report": (res.get("report") or "")[:1500], "metrics": res.get("metrics"), "features": res.get("features"), "tuning": res.get("tuning"), "models": res.get("models"),
             **agent_numbers({"seconds": res["agent_s"], "stats": res["stats"], "actions": res["actions"], "rag_hit": res["rag_hit"]})}
 
@@ -171,13 +178,13 @@ def build_md(meta: dict, cases: list[dict], cmp: dict | None = None) -> str:
             L.append(f"| {k} | {cnt(k,'PASS')} | {cnt(k,'PARTIAL') + cnt(k,'WARN')} | {cnt(k,'FAIL')} | {cnt(k,'SKIP')} |")
     if cmp:
         L += comparison_md(cmp)
-    L += ["", "## Results", "| kind | case | run | status | root cause | writes | MTTR s | agent s | LLM err | RAG |", "|---|---|---|---|---|---|---|---|---|---|"]
+    L += ["", "## Results", "| kind | case | run | status | root cause | writes | restart-only | MTTR s | agent s | LLM err | RAG |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     arm_of = lambda c: f"{c['name']} [{c['arm']}]" if c.get("arm") else c["name"]
     for c in cases:
         if c["kind"] == "guard":
             continue
         L.append(f"| {c['kind']} | {arm_of(c)} | {c.get('run','')} | {c['status']} | {c.get('root_cause_correct','-')} | "
-                 f"{len(c.get('actions') or [])} | {c.get('mttr_s','-')} | {c.get('agent_s','-')} | {c.get('llm_errors','-')} | {c.get('rag_hit','-')} |")
+                 f"{len(c.get('actions') or [])} | {c.get('restart_only','-')} | {c.get('mttr_s','-')} | {c.get('agent_s','-')} | {c.get('llm_errors','-')} | {c.get('rag_hit','-')} |")
     g = [c for c in cases if c["kind"] == "guard"]
     if g:
         L += ["", f"## Guard checks ({sum(c['status']=='PASS' for c in g)}/{len(g)} passed)"]
@@ -219,6 +226,8 @@ def main():
     ap.add_argument("--compare", action="store_true", help="run every scenario with every arm and write an arm-by-arm comparison")
     ap.add_argument("--arms", default=",".join(DEFAULT_ARMS), help="arms to compare (comma list of: " + ", ".join(ARMS) + "). Default: the four behaviour arms; "
                     "the cumulative cost arms (cost-base ... cost-budget) are opt-in")
+    ap.add_argument("--split", choices=["dev", "heldout", "all"], default="all", help="which scenarios 'all' means: the dev split (runbooks may be tuned against it), "
+                    "the held-out split (frozen: never tune against it) or both. A scenario file's `split:` key; default dev")
     ap.add_argument("--negative", action="store_true", help="healthy-system test")
     ap.add_argument("--stale", action="store_true", help="stale-alert test per scenario")
     ap.add_argument("--fresh-rag", action="store_true", help="clear incident memory before every case")
@@ -247,11 +256,15 @@ def main():
     except ValueError as e:
         sys.exit(f"--tuning: {e}")
 
-    avail = sorted(p.stem for p in rs.SCENARIO_DIR.glob("*.yaml"))
+    import yaml
+    split_of = {p.stem: (yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("split", "dev") for p in rs.SCENARIO_DIR.glob("*.yaml")}
+    avail = sorted(n for n, s in split_of.items() if ns.split in ("all", s))
     names = [] if ns.scenarios == "none" else avail if ns.scenarios == "all" else ns.scenarios.split(",")
-    unknown = [n for n in names if n not in avail]
+    unknown = [n for n in names if n not in split_of]
     if unknown:
-        sys.exit(f"unknown scenarios {unknown}; available: {avail}")
+        sys.exit(f"unknown scenarios {unknown}; available: {sorted(split_of)}")
+    if ns.scenarios not in ("all", "none") and ns.split != "all" and (off := [n for n in names if split_of[n] != ns.split]):
+        sys.exit(f"--split {ns.split} but {off} belong to another split")
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))      # a Stop from the console unwinds through run_once's cleanup
     if (left := rs.recover_active()):
@@ -264,7 +277,7 @@ def main():
         out = ROOT / "reports" / f"{ts:%Y%m%dT%H%M%S}-{n}"
     out.mkdir(parents=True)
     meta = {"ts": ts.isoformat(timespec="seconds"), "provider": PROVIDER, "model": MODEL_NAME, "namespace": NAMESPACE,
-            "dry_run": DRY_RUN, "args": vars(ns), "tuning": tuning.as_dict(), "tuning_changed": tuning.changed(), "mode": "compare" if ns.compare else "suite",
+            "dry_run": DRY_RUN, "args": vars(ns), "splits": {n: split_of[n] for n in names}, "tuning": tuning.as_dict(), "tuning_changed": tuning.changed(), "mode": "compare" if ns.compare else "suite",
             "arms": arms if ns.compare else None}
     cases: list[dict] = []
 

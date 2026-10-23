@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from sre_agent import rag
+from sre_agent import hypothesis as hyp
 from sre_agent.clients import prom_query
 from sre_agent.config import NAMESPACE, DRY_RUN, PROVIDER, MODEL_NAME, SUB_PROVIDER, SUB_MODEL, METRICS as M
 from sre_agent.detect import find_problems
@@ -193,7 +194,8 @@ def _worker(run: dict) -> None:
         r = run_alert(run["alert"], auto_approve=run["auto_approve"], ask=ask, on_start=lambda p: run.update(log=Path(p).name), features=Features(**run["features"]),
                       tuning=Tuning(**run["tuning"]))
         run.update(status="done", result={"final": r["final"], "actions": r["actions"], "stats": r["stats"],
-                                          "rag_hit": r["rag_hit"], "seconds": r["seconds"], "features": r["features"], "tuning": r.get("tuning"), "models": r["models"]})
+                                          "rag_hit": r["rag_hit"], "seconds": r["seconds"], "features": r["features"], "tuning": r.get("tuning"), "models": r["models"],
+                                          "hypotheses": r.get("hypotheses")})
     except Exception as e:
         run.update(status="error", error=f"{type(e).__name__}: {e}")
 
@@ -227,6 +229,20 @@ def get_run(rid: str):
     if rid not in RUNS:
         raise HTTPException(404)
     return public(RUNS[rid])
+
+
+@app.get("/api/runs/{rid}/hypotheses")
+def run_hypotheses(rid: str):
+    """The hypothesis ledger of a run: final when the run is done, live (the process-wide ledger) while it is running.
+    404 when the run does not exist; `enabled: false` (no ledger) when the run was started without the technique."""
+    run = RUNS.get(rid)
+    if not run:
+        raise HTTPException(404)
+    if not run["features"].get("hypothesis"):
+        return {"enabled": False, "ledger": None}
+    if run["result"]:
+        return {"enabled": True, "ledger": run["result"].get("hypotheses")}
+    return {"enabled": True, "ledger": hyp.snapshot() if run["status"] in ("running", "waiting_approval") else None}
 
 
 class Decision(BaseModel):

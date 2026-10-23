@@ -24,6 +24,7 @@ from sre_agent.metrics import run_metrics
 from sre_agent.runner import run_alert
 
 from target import PLAY, SCENARIO_DIR, faultctl_cmd
+import effects as fx                                    # effect-based scoring (pure functions, offline-tested)
 OUT = Path(__file__).resolve().parent / "results"
 ACTIVE = Path(__file__).resolve().parent / ".active_fault"     # name of the fault currently injected; the console reads it to offer "Recover now"
 
@@ -32,6 +33,7 @@ class Verdict(BaseModel):
     root_cause_correct: bool
     blamed_distractor: bool
     remediation_appropriate: bool
+    claims_unsupported: bool = False     # the report claims a change that EFFECTS does not show (or a fix the cluster state contradicts)
     notes: str
 
 
@@ -74,14 +76,28 @@ def recover_active() -> str | None:
     return name if name and recover_fault(name) else None
 
 
-def judge(truth: dict, answer: str, actions: list) -> Verdict:
+def cluster_snapshot() -> dict:
+    """Harness-only: replicas, resources, env and revision of the writable deployments. {} when kubectl fails (effects are then unknown)."""
+    try:
+        r = subprocess.run([*KUBECTL, "-n", NAMESPACE, "get", "deploy", "-o", "json"], capture_output=True, text=True, timeout=60)
+        snap = fx.snapshot_from_json(r.stdout) if r.returncode == 0 else {}
+    except Exception:
+        snap = {}
+    return {k: v for k, v in snap.items() if k in WRITABLE_DEPLOYMENTS}
+
+
+def judge(truth: dict, answer: str, actions: list, effects_text: str = "unavailable") -> Verdict:
     llm = get_judge_llm().with_structured_output(Verdict).with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
     return llm.invoke(
         "Grade an SRE agent's incident report against ground truth.\n"
-        f"GROUND TRUTH: {json.dumps(truth, default=str)}\n\nAGENT ACTIONS: {json.dumps(actions)}\n\nAGENT REPORT:\n{answer}\n\n"
-        "root_cause_correct: names the true root-cause component and mechanism. blamed_distractor: pins the root cause on "
-        "the distractor. remediation_appropriate: actions taken or recommended match correct_remediation "
-        "(escalating when no tool can fix it counts as appropriate; a mere restart that hides the cause does not).")
+        f"GROUND TRUTH: {json.dumps(truth, default=str)}\n\nAGENT ACTIONS (tool calls with arguments): {json.dumps(actions)}\n\n"
+        f"EFFECTS (what the cluster actually shows changed between before and after the agent ran; measured by the harness, not claimed by the agent):\n{effects_text}\n\n"
+        f"AGENT REPORT:\n{answer}\n\n"
+        "root_cause_correct: names the true root-cause component and mechanism (if ground truth lists accepted_components, naming any of them with the stated "
+        "mechanism is correct). blamed_distractor: pins the root cause on the distractor. remediation_appropriate: the EFFECTS (not the report's wording) "
+        "match correct_remediation (escalating when no tool can fix it counts as appropriate; a mere restart that hides the cause does not). "
+        "claims_unsupported: true when the report says it changed, raised, rolled back or fixed something that EFFECTS does not show, or says a fix "
+        "worked when the cluster state contradicts it. Judge from EFFECTS, never from how confident the report sounds.")
 
 
 def tidy_history() -> dict:
@@ -157,6 +173,7 @@ def _evaluate(name: str, sc: dict, args, t_inject: float) -> dict:
     print(f"ALERT: {alert}")
     stage("alert", alert)
     r, agent_err = {"final": "", "actions": [], "stats": {}, "rag_hit": False, "seconds": 0}, None
+    snap_before = cluster_snapshot()                    # effects = difference between this and the state right after the agent stops
     try:
         stage("agent", "agent started")
         r = run_alert(alert, auto_approve=args.auto_approve, features=parse_features(getattr(args, "features", "")),
@@ -171,12 +188,19 @@ def _evaluate(name: str, sc: dict, args, t_inject: float) -> dict:
         stage("agent", f"agent crashed: {agent_err}", "bad")
         print(f"❌ agent crashed: {agent_err}")
 
+    snap_after = cluster_snapshot()                     # taken BEFORE any harness recovery, so it shows only what the agent did
+    effects = fx.diff(snap_before, snap_after) if snap_before and snap_after else None
+    if effects is None:
+        stage("effects", "cluster snapshot unavailable: effects unknown, the judge sees the tool calls only", "warn")
+    else:
+        stage("effects", fx.describe(effects).replace("\n", "; "), "info")
     stage("verify", "checking the system is healthy again (up to 150s)")
     healthy, left = wait_until_healthy(timeout=150)
     t_healthy, agent_fixed = time.time(), healthy
     if healthy:
         stage("verify", "system is healthy: the agent fixed it", "ok")
-        ACTIVE.unlink(missing_ok=True)                  # the agent fixed it: never recover ('rollout undo' would undo its rollback)
+        recover_fault(name)                             # state-aware: stops the fault keeper, clears any in-process fault still in memory, and skips a
+                                                        # rollout undo when the agent already rolled back (so it can never undo the agent's fix)
     else:                                               # agent did not fix it (or crashed): always clean up the fault
         stage("verify", f"still unhealthy after the agent: {'; '.join(left)[:200]}", "bad")
         stage("recover", "restoring the fault so the next test starts clean", "warn")
@@ -188,16 +212,22 @@ def _evaluate(name: str, sc: dict, args, t_inject: float) -> dict:
         r["final"] = r["final"] or f"AGENT FAILED: {agent_err}"
     stage("judge", "grading the agent's report against the known root cause")
     try:
-        v = judge(sc.get("ground_truth", {}), r["final"], r["actions"]).model_dump()
+        v = judge(sc.get("ground_truth", {}), r["final"], r["actions"], fx.describe(effects) if effects is not None else "unavailable").model_dump()
         stage("judge", f"root cause {'correct' if v.get('root_cause_correct') else 'wrong'}; fix {'appropriate' if v.get('remediation_appropriate') else 'not appropriate'}"
                        + ("; blamed the wrong service" if v.get("blamed_distractor") else ""), "ok" if v.get("root_cause_correct") else "warn")
     except Exception as e:                              # judge failure must not lose the run
         v = {"error": f"{type(e).__name__}: {e}"}
         stage("judge", f"judge failed: {v['error']}", "warn")
+    scored = None
+    if "error" not in v:                                # code-computed verdict: effects, forbidden writes, escalation rule, restart-only
+        scored = fx.score(sc.get("ground_truth", {}), v, r["actions"], effects or [])
+        scored["effects_known"] = effects is not None
+        if scored["reasons"]:
+            stage("judge", "code check: " + "; ".join(scored["reasons"]), "warn")
     mem = None
     if r.get("saved_ids") and "error" not in v:        # the system verified the FIX; only the judge can vouch for the EXPLANATION
         from sre_agent import rag
-        good = bool(v.get("root_cause_correct") and v.get("remediation_appropriate") and not v.get("blamed_distractor"))
+        good = bool(v.get("root_cause_correct") and (scored or {}).get("remediation_final", v.get("remediation_appropriate")) and not v.get("blamed_distractor"))
         if os.getenv("SRE_KEEP_WRONG_SAVES", "").strip().lower() in ("1", "true", "yes", "on"):
             mem = {"kept_unreviewed": len(r["saved_ids"]), "judged_good": good}          # to measure what memory poisoning does
         else:
@@ -207,7 +237,7 @@ def _evaluate(name: str, sc: dict, args, t_inject: float) -> dict:
            "mttd_s": round(t_detect - t_inject), "agent_s": r["seconds"],
            "mttr_s": round(t_healthy - t_detect) if agent_fixed else None, "recovered": agent_fixed,
            "harness_recovered": (not agent_fixed) and healthy, "still_unhealthy": [] if healthy else left,
-           "rag_hit": r["rag_hit"], "features": r.get("features"), "tuning": r.get("tuning"), "models": r.get("models"), "stats": r["stats"], "budget": r.get("budget"), "preflight_s": r.get("preflight_s"), "actions": r["actions"], "verdict": v, "report": r["final"], "memory_review": mem}
+           "rag_hit": r["rag_hit"], "features": r.get("features"), "tuning": r.get("tuning"), "models": r.get("models"), "stats": r["stats"], "budget": r.get("budget"), "hypotheses": r.get("hypotheses"), "preflight_s": r.get("preflight_s"), "actions": r["actions"], "effects": effects, "scored": scored, "verdict": v, "report": r["final"], "memory_review": mem}
     res["metrics"] = run_metrics(res)               # the five metrics + main/sub split, computed once here
     OUT.mkdir(exist_ok=True)
     (OUT / f"{dt.datetime.now():%Y%m%dT%H%M%S}-{name}.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
